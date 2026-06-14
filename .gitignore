@@ -1,0 +1,27 @@
+# Build artifacts
+*.deb
+*.buildinfo
+*.changes
+*.dsc
+*.tar.gz
+*.tar.xz
+/build/
+/debian/.debhelper/
+/debian/files
+/debian/*.substvars
+/debian/tmp/
+
+# Patch workspaces
+/my-patches/
+*.patch.orig
+*.orig
+*.rej
+
+# Editor / OS
+*.swp
+*~
+.DS_Store
+
+# OMC agent state
+.omc/
+.claude/
