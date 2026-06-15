@@ -34,10 +34,15 @@ ad-hoc scripts.
   TCP/TLS processing is offloaded to the Infrastructure Proxy.
 
 ### 2.2 Unified Infrastructure Proxy (decoupled from SDN)
-- New UI panel under **Datacenter → System → Network**.
+- New UI panel at the **Datacenter** level, adjacent to the existing ACME / SDN
+  configuration (not an invented `System → Network` sub-tree — that does not match
+  current PVE information architecture).
 - Decoupled from tenant-focused SDN overlays to prevent accidental disruptions.
-- **Underlay VRF execution:** proxies rely on native Linux VRFs via `ifupdown2`;
-  HAProxy runs inside isolated namespaces using `ip vrf exec`.
+- **VRF-scoped execution:** proxies rely on native Linux VRFs via `ifupdown2`;
+  HAProxy runs in a **VRF context** using `ip vrf exec`. Note: `ip vrf exec` binds
+  sockets into a VRF via `SO_BINDTODEVICE`-style mechanisms — it is **not** a
+  network namespace, and has different semantics for listening sockets and DNS
+  resolution. Do not describe it as namespace isolation.
 - **Supported backends:** Ceph RadosGW (object storage) or the Proxmox VE API
   (management).
 - **Port conflict resolution:** HAProxy MUST NEVER use wildcard binds (`*:80` /
@@ -54,13 +59,38 @@ ad-hoc scripts.
 - **Mode B — All-Active Load Sharing:** maximizes throughput. External DNS
   round-robin resolves the S3/API endpoint to multiple PVE node IPs where HAProxy
   instances listen locally; requires external DNS health checks to drop dead nodes
-  from the A-record pool.
+  from the A-record pool. ⚠️ Caveat: most DNS servers (e.g. stock BIND) do **not**
+  health-check A-records, so dead nodes keep serving failures. Treat this mode as
+  best-effort unless paired with a health-aware DNS/global LB.
+- **Mode C — Anycast (advanced, opt-in):** announce a single S3 VIP from every RGW
+  node via BGP/EVPN (PVE SDN already ships FRR). More robust than DNS-RR and faster
+  to converge than VRRP failover. ⚠️ This **reintroduces an SDN/FRR dependency**,
+  which conflicts with the "decoupled from SDN" principle above, so it must remain
+  explicitly opt-in for sites already running a routed fabric — never the default.
+
+Topology note: Mode A (HAProxy + Keepalived) mirrors Ceph's own `cephadm` RGW
+ingress service by design. Copy that proven ingress configuration logic; do **not**
+adopt `cephadm` as a second control plane beside `pveceph`.
 
 ### 2.4 Cluster-centric service certificates
-- **Global storage (`pmxcfs`):** service certificates stored in the replicated
-  cluster filesystem at `/etc/pve/priv/custom-certs/`.
-- **DNS-01 enforcement:** UI strictly enforces existing DNS-01 ACME plugins
-  (HTTP-01 cannot reliably route through floating VIPs or round-robin DNS).
+- **Global storage (`pmxcfs`):** service certificate/key material stored in the
+  replicated cluster filesystem under `/etc/pve/priv/<service>/`, using **plain
+  file operations** — the same pattern PVE already uses for storage secrets
+  (`/etc/pve/priv/storage/<id>.pw`). This needs **no `pmxcfs` C patch**: arbitrary
+  private subpaths under `/etc/pve/priv/` are already permitted. (A `cfs_register_file`
+  observed-file entry is only needed for *structured* `cfs_read_file/cfs_write_file`
+  config, which raw cert blobs do not require.)
+- **Reuse existing ACME plumbing:** integrate with the existing `pve-manager` ACME
+  account/plugin framework and surface these service certs in the existing
+  Datacenter **Certificates** UI rather than inventing a parallel cert system.
+- **DNS-01 preferred:** the UI recommends/defaults to existing DNS-01 ACME plugins
+  for shared/wildcard/floating endpoints, where they avoid ingress routing tricks.
+  HTTP-01 is **not impossible** (PVE ships a standalone plugin, and HAProxy can
+  route `/.well-known/acme-challenge/`), so it remains a supported fallback — do not
+  claim HTTP-01 "cannot route."
+- **Single cert-lead renewal:** elect one node as renewal lead (or renew once then
+  propagate via `pmxcfs`) to avoid all nodes hitting ACME/CA rate limits or DNS
+  provider locks simultaneously.
 - **Automated soft reloads:** a cron renewal triggers `systemctl reload` on mapped
   HAProxy instances, updating certs without dropping active TCP connections.
 
@@ -74,11 +104,19 @@ Proxmox acts as the infrastructure **control plane**, not an object-storage file
   daemon distribution; GUI wrapper around `radosgw-admin` to provision S3 users,
   generate keys, apply basic quotas.
 - **Advanced Storage Constraints** (creation wizard): allows physical pool
-  separation to avoid IOPS contention —
-  - *Index Pool Rule:* CRUSH rule for `.rgw.buckets.index` (best practice: fast
-    NVMe/SSD rules for metadata queries).
-  - *Data Pool Rule / Profile:* CRUSH rule for `.rgw.buckets.data` (e.g. `hdd-only`)
-    or an Erasure Coded profile (e.g. `ec-4-2-profile`).
+  separation to avoid IOPS contention. This must be modelled as Ceph **placement
+  targets / storage classes** on the zone/zonegroup — *not* as two hardcoded CRUSH
+  dropdowns — because RGW bucket placement is defined there and is **immutable after
+  bucket creation**:
+  - *Index pool:* CRUSH rule for the bucket index pool (best practice: fast
+    NVMe/SSD rules for metadata/omap queries).
+  - *Data pool:* CRUSH rule (e.g. `hdd-only`) or Erasure Coded profile (e.g.
+    `ec-4-2-profile`) for object data.
+  - *Data-extra pool:* a **replicated** pool for multipart-upload metadata and omap.
+    This is **mandatory when the data pool is EC** (EC cannot hold omap), and the
+    wizard must allocate it automatically — a common omission that breaks EC RGW.
+  - The wizard should expose named **placement targets** and **storage classes**
+    (e.g. `STANDARD`, `COLD`) rather than implying a single fixed pool layout.
 
 **End-user / tenant scope:**
 - Proxmox Web UI (tenant view): highly restricted — view S3 endpoint URL,
@@ -92,9 +130,13 @@ PVE session-based auth cannot fulfill S3 SigV4. Two control-plane provisioning m
 - **Mode A — Isolated Native Auth (default):** hypervisor is air-gapped from tenant
   data. Proxmox runs `radosgw-admin user create` to generate standalone S3
   access/secret keys, separate from PVE login credentials.
-- **Mode B — Identity Federation (OIDC/STS):** RGW daemon trusts an external OIDC
-  provider (e.g. Keycloak). Clients trade a JWT for temporary S3 credentials via
-  the STS endpoint — enterprise SSO without putting PVE in the data path.
+- **Mode B — Identity Federation (OIDC/STS):** clients trade a JWT for temporary S3
+  credentials via RGW's STS endpoint (`AssumeRoleWithWebIdentity`) — enterprise SSO
+  without putting PVE in the data path. This is more than "RGW trusts an OIDC
+  provider"; the control plane must provision: an **RGW OIDC provider object** for
+  the issuer (e.g. Keycloak), **IAM roles** with trust policies referencing the
+  provider, and the per-role **permission policies**. Spec must define how PVE maps
+  its tenant/group model onto these roles.
 
 ## 3. Packaging, patching & distribution strategy
 
@@ -102,16 +144,26 @@ This cannot be 100% greenfield due to Proxmox's monolithic API/UI structures.
 
 - **Greenfield packages:** two net-new `.deb` packages —
   - `pve-ceph-radosgw` — backend Perl logic, dependency mapping, `systemd` automation.
-  - `pve-infra-proxy` — Infrastructure Proxy backend logic and `systemd` automation.
-- **Stock overrides (forks/patches):**
-  - `pve-manager`: patch to inject new API routing endpoints into `Ceph.pm` and new
-    UI views into `pvemanagerlib.js`.
-  - `pve-cluster`: patch the `pmxcfs` C source (`status.c`, `memdb.c`) to whitelist
-    the new `/etc/pve/priv/custom-certs/` directory.
-- **Versioning & safety:** OBS builds use the `+` symbol in version strings (e.g.
-  `9.0.1-1+rgw1`) to reliably override stock Proxmox packages. Test environments
-  must use APT pinning (`Pin-Priority: 1001`) to prevent upstream security updates
-  from blindly overwriting custom packages before the OBS pipeline can sync.
+  - `pve-service-gateway` (working name; `pve-infra-proxy` is too generic) —
+    Infrastructure Proxy backend logic and `systemd` automation.
+- **Stock overrides (forks/patches) — real surfaces:**
+  - `pve-manager`: add API endpoints under `PVE/API2/...`, RGW lifecycle CLI in
+    **`PVE/CLI/pveceph.pm`** (not only `Ceph.pm`), and UI views in the modular
+    **`www/manager6/*.js`** tree (**not** `pvemanagerlib.js`, which is a generated
+    concatenation), plus the corresponding `Makefile` entries.
+  - `pve-cluster`: **no C patch expected.** Cert/key blobs live under
+    `/etc/pve/priv/<service>/` via plain file ops (see §2.4). Only *if* a structured
+    observed config file is genuinely required, patch the observed-file registries
+    (`PVE/Cluster.pm` + `pmxcfs/status.c`) — **never `memdb.c`**, which is the
+    in-memory DB, not the whitelist.
+- **Versioning & safety:** the `+` suffix does **not** reliably win — `9.0.1-1+rgw1`
+  sorts *before* the next upstream `9.0.2-1`, so stock updates will overtake it.
+  The only durable strategy is to **continuously rebase the downstream packages onto
+  each upstream release**. Use **narrow, per-package APT pins** targeting only the
+  affected packages from the downstream repo. Avoid `Pin-Priority > 1000`, which APT
+  treats as "allow downgrades" and is actively dangerous; a pin in the
+  `500 < priority ≤ 1000` range is sufficient to prefer the downstream build without
+  enabling downgrades.
 
 ## 4. Upstream sources (git.proxmox.com)
 
@@ -119,8 +171,8 @@ Mirror/reference these upstream repos; do **not** vendor blindly — track patch
 
 | Upstream repo | Clone URL | Relevance |
 |---|---|---|
-| `pve-manager` | `https://git.proxmox.com/git/pve-manager.git` | API (`PVE/API2/Ceph/`, `Ceph.pm`), CLI (`pveceph`), Web UI (`pvemanagerlib.js`) |
-| `pve-cluster` | `https://git.proxmox.com/git/pve-cluster.git` | `pmxcfs` cluster FS (`status.c`, `memdb.c`), `/etc/pve` |
+| `pve-manager` | `https://git.proxmox.com/git/pve-manager.git` | API (`PVE/API2/...`), CLI (`PVE/CLI/pveceph.pm`), modular Web UI (`www/manager6/*.js`) |
+| `pve-cluster` | `https://git.proxmox.com/git/pve-cluster.git` | `pmxcfs` cluster FS, `/etc/pve` secret storage (`/etc/pve/priv/...`); observed-file registry in `PVE/Cluster.pm` + `status.c` (not `memdb.c`) |
 | `ceph` | `https://git.proxmox.com/git/ceph.git` | Proxmox Ceph packaging (RGW/Beast, `radosgw-admin`) |
 | `pve-storage` | `https://git.proxmox.com/git/pve-storage.git` | Storage plugin library |
 | `librados2-perl` | `https://git.proxmox.com/git/librados2-perl.git` | Perl bindings for librados |
@@ -190,3 +242,53 @@ Read-only clone form: `git clone git://git.proxmox.com/git/<repo>.git`
 - HAProxy config generators MUST refuse wildcard binds (`*:80`/`*:443`).
 - This file (`AGENTS.md`) is authoritative; `CLAUDE.md` symlinks to it. Update both
   by editing `AGENTS.md` only.
+- **v1 scope is RGW only.** Defer fronting the PVE API through the same gateway —
+  it doubles the security blast radius for little functional gain.
+
+## 7. Tenant & identity model (open — must be specified before build)
+
+PVE has **no native "tenant" object**, so the admin/tenant split in §2.5–2.6 is
+undefined until this is pinned down:
+- **Map a tenant → PVE Group** (most flexible: multiple users share one S3
+  identity, quota, and key set). Alternatives — Realm or single User — are weaker.
+- Define a new PVE privilege set, e.g. `S3.Allocate`, `S3.Audit`, `S3.KeyManage`,
+  applied via the standard ACL system, so tenant views are permission-gated rather
+  than a bolt-on portal.
+- The OIDC/STS mode (§2.6) must define how this group model maps onto RGW IAM roles.
+
+Required tenant workflows the current spec omits:
+- **Key revocation** (immediate disable on leak), not just rotation.
+- **Bucket lifecycle**: versioning + lifecycle (transition/expiration) toggles, or
+  the tenant scope is too thin and forces users back to the CLI for basic hygiene.
+- **Quota-utilization alerts** and a per-tenant usage view; admin "top consumers".
+
+## 8. Operational concerns (open — must be specified before build)
+
+- **Observability:** surface RGW health / latency / 5xx and HAProxy stats. Feed the
+  existing PVE **Metric Server** (InfluxDB/Graphite); optionally expose a local-only
+  HAProxy `/metrics` endpoint. The spec is currently silent on monitoring.
+- **Metadata backup/restore:** object *data* lives in Ceph, but the **realm / zone /
+  zonegroup / user / key** metadata needs an explicit export+restore plan — losing
+  it makes the key↔user mapping unrecoverable even with intact data pools.
+- **Upgrade path:** define how `pve-ceph-radosgw` handles Ceph major-version
+  transitions and RGW config-schema changes across PVE 9.x point releases.
+- **Beast tuning:** generate sane thread/buffer settings for high-concurrency S3
+  rather than shipping Beast defaults.
+
+## 9. Failure modes to design for (open)
+
+- **RGW daemon crash** → HAProxy health-check must drain that backend; define check
+  type (S3 `GET /` vs. TCP) and thresholds.
+- **VRF misconfiguration** → detection and safe recovery; never leave a half-bound
+  listener.
+- **Cert renewal failure** → alert + keep serving the old cert until it actually
+  expires; never hard-fail the listener on a renewal error.
+- **All-active split assumptions** → see §2.3 Mode B caveat; prefer Mode C anycast
+  where real health-based withdrawal is required.
+
+---
+
+> **Review status:** §§2–4 above were fact-checked on 2026-06-14 against the current
+> upstream `pve-manager` / `pve-cluster` / `pve-storage` trees and official Ceph,
+> Proxmox, Debian and Linux-VRF docs (tri-model review). §§7–9 capture open design
+> decisions surfaced by that review and must be resolved before implementation.
