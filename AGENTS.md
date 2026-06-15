@@ -188,7 +188,13 @@ This cannot be 100% greenfield due to Proxmox's monolithic API/UI structures.
     **`PVE/CLI/pveceph.pm`** (not only `Ceph.pm`), and UI views in the modular
     **`www/manager6/*.js`** tree (**not** `pvemanagerlib.js`, which is a generated
     concatenation), plus the corresponding `Makefile` entries.
-  - `pve-cluster`: **no C patch expected.** Cert/key blobs live under
+  - `pve-access-control`: add the `/objectstorage/<tenant>` ACL path to `check_path`
+    and register the new `S3.Allocate` / `S3.Audit` / `S3.Use` privileges and stock
+    roles in `src/PVE/AccessControl.pm` (mirrors the SDN precedent). See
+    [ADR 0001](docs/adr/0001-tenant-model.md).
+  - `pve-cluster`: one small **observed-file registration** for tenant metadata
+    (`objectstorage.cfg`) in `PVE/Cluster.pm` + `pmxcfs/status.c` — **not `memdb.c`**.
+    No other C patch expected. Cert/key blobs live under
     `/etc/pve/priv/<service>/` via plain file ops (see §2.4). Only *if* a structured
     observed config file is genuinely required, patch the observed-file registries
     (`PVE/Cluster.pm` + `pmxcfs/status.c`) — **never `memdb.c`**, which is the
@@ -214,13 +220,15 @@ Mirror/reference these upstream repos; do **not** vendor blindly — track patch
 | `pve-storage` | `https://git.proxmox.com/git/pve-storage.git` | Storage plugin library |
 | `librados2-perl` | `https://git.proxmox.com/git/librados2-perl.git` | Perl bindings for librados |
 | `pve-common` | `https://git.proxmox.com/git/pve-common.git` | `README.dev` build instructions, shared tooling |
+| `pve-access-control` | `https://git.proxmox.com/git/pve-access-control.git` | ACL paths + privileges/roles (`PVE/AccessControl.pm`) for the tenant model |
 
 Read-only clone form: `git clone git://git.proxmox.com/git/<repo>.git`
 
 **Downstream forks** (for our patch series; mirror of the canonical `git.proxmox.com`
 trees, kept rebased on upstream — see §3 versioning):
-`pve-manager`, `pve-cluster`, `pve-storage`, `pve-network`, `pve-common` are forked
-to `github.com/ciroiriarte/<repo>`. Add upstream as a second remote and rebase:
+`pve-manager`, `pve-cluster`, `pve-storage`, `pve-network`, `pve-common` and
+`pve-access-control` are forked to `github.com/ciroiriarte/<repo>`. Add upstream as a
+second remote and rebase:
 `git remote add upstream https://git.proxmox.com/git/<repo>.git`.
 
 ## 5. Development guidelines (from pve.proxmox.com/wiki/Developer_Documentation)
@@ -288,16 +296,22 @@ to `github.com/ciroiriarte/<repo>`. Add upstream as a second remote and rebase:
 - **v1 scope is RGW only.** Defer fronting the PVE API through the same gateway —
   it doubles the security blast radius for little functional gain.
 
-## 7. Tenant & identity model (open — must be specified before build)
+## 7. Tenant & identity model — **decided ([ADR 0001](docs/adr/0001-tenant-model.md))**
 
-PVE has **no native "tenant" object**, so the admin/tenant split in §2.5–2.6 is
-undefined until this is pinned down:
-- **Map a tenant → PVE Group** (most flexible: multiple users share one S3
-  identity, quota, and key set). Alternatives — Realm or single User — are weaker.
-- Define a new PVE privilege set, e.g. `S3.Allocate`, `S3.Audit`, `S3.KeyManage`,
-  applied via the standard ACL system, so tenant views are permission-gated rather
-  than a bolt-on portal.
-- The OIDC/STS mode (§2.6) must define how this group model maps onto RGW IAM roles.
+PVE has no native "tenant" object. Resolved design:
+- A **tenant** is a first-class object-storage tenant at ACL path
+  `/objectstorage/<tenant>`, backed **1:1 by an RGW tenant namespace** (`tenant$user`
+  + namespaced buckets → server-side isolation).
+- New privileges **`S3.Allocate` / `S3.Audit` / `S3.Use`** (verb split mirroring
+  SDN), plus stock roles `PVES3Admin` / `PVES3User`. `S3.KeyManage` stays folded
+  unless a separation-of-duty need appears.
+- **Membership is an ACL binding, not an equation:** grant a PVE **Group**
+  (preferred), user, or token a role on `/objectstorage/<tenant>` — never hard-equate
+  tenant = group. The OIDC/STS mode (§2.6) maps that group onto per-tenant RGW IAM
+  roles.
+- Requires patching **`pve-access-control`** (`check_path` + privilege/role
+  registration) and a small observed-file (`objectstorage.cfg`) in `pve-cluster`.
+See ADR 0001 for alternatives weighed (Pool/Group/User/Realm) and open sub-questions.
 
 Required tenant workflows the current spec omits:
 - **Key revocation** (immediate disable on leak), not just rotation.

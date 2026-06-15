@@ -49,9 +49,11 @@ Phases 1 and 3 are independent after Phase 0 and can run in parallel.
 **Objective:** a reproducible build/test loop and the one decision that unblocks all
 user-facing work.
 
-- **Gate (§7) — Tenant/identity ADR.** Decide tenant → **PVE Group** mapping and the
-  new privilege set (`S3.Allocate`, `S3.Audit`, `S3.KeyManage`). Everything in
-  Phases 2/4 depends on this. Ship as `docs/adr/0001-tenant-model.md`.
+- **Gate (§7) — Tenant/identity ADR. ✅ Drafted:**
+  [`docs/adr/0001-tenant-model.md`](adr/0001-tenant-model.md). Tenant = first-class
+  object at ACL path `/objectstorage/<tenant>` ⇔ RGW tenant namespace; new `S3.*`
+  privileges; membership via ACL group binding. Needs `pve-access-control` patch.
+  Move to **Accepted** once reviewed; everything in Phases 2/4 depends on it.
 - Stand up a **3-node PVE 9 (Trixie) test cluster** with Ceph (mon/mgr/osd) and the
   `download.proxmox.com/debian/devel` repo enabled.
 - Establish the **fork → rebase workflow**: `upstream` remote on each

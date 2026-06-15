@@ -26,6 +26,12 @@ Maintained by Ciro Iriarte <ciro.iriarte+software@gmail.com>.
 - `docs/ROADMAP.md` — phased implementation plan (Phase 0 foundations + tenant
   ADR through Phase 6 hardening/upstreaming), with dependency graph, per-phase
   exit criteria, and the §§7–9 decision gates.
+- `docs/adr/0001-tenant-model.md` — tenant = first-class object at ACL path
+  `/objectstorage/<tenant>` ⇔ RGW tenant namespace; new `S3.Allocate/Audit/Use`
+  privileges + stock roles; membership via ACL group binding (not equation).
+  Grounded in `pve-access-control` source (SDN precedent). Resolves §7.
+- Identified and forked **`pve-access-control`** as a new patch surface (ACL path +
+  privileges); recorded in AGENTS.md §§3–4 and §7.
 
 ### Changed
 - Fact-checked the spec against current upstream `pve-manager`/`pve-cluster`/
