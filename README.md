@@ -28,7 +28,8 @@ Proxmox management stack, "the Proxmox Way": native `pveceph`, Linux VRFs, and
 ## Documentation
 
 See **[AGENTS.md](AGENTS.md)** for the full design, upstream sources, and the
-Proxmox developer guidelines this project follows.
+Proxmox developer guidelines this project follows, and
+**[docs/ROADMAP.md](docs/ROADMAP.md)** for the phased implementation plan.
 
 ## License
 

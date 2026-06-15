@@ -23,6 +23,9 @@ Maintained by Ciro Iriarte <ciro.iriarte+software@gmail.com>.
   (not Depends) confirmation, sharpening the SDN-vs-FRR boundary.
 - Note that RGW is partially scaffolded upstream (`radosgw` service +
   `rgw` pool application) — extend rather than greenfield (§3).
+- `docs/ROADMAP.md` — phased implementation plan (Phase 0 foundations + tenant
+  ADR through Phase 6 hardening/upstreaming), with dependency graph, per-phase
+  exit criteria, and the §§7–9 decision gates.
 
 ### Changed
 - Fact-checked the spec against current upstream `pve-manager`/`pve-cluster`/
