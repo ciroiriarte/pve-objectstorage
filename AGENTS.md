@@ -37,7 +37,11 @@ ad-hoc scripts.
 - New UI panel at the **Datacenter** level, adjacent to the existing ACME / SDN
   configuration (not an invented `System → Network` sub-tree — that does not match
   current PVE information architecture).
-- Decoupled from tenant-focused SDN overlays to prevent accidental disruptions.
+- Decoupled from tenant-focused SDN **overlays** (zones/vnets/controllers) to
+  prevent accidental disruptions. Note the boundary: this means staying out of the
+  tenant overlay plane — it does **not** forbid using a routing daemon (FRR or a
+  standalone BGP speaker) at the underlay, which the SDN subsystem merely happens to
+  also consume. See Mode C in §2.3.
 - **VRF-scoped execution:** proxies rely on native Linux VRFs via `ifupdown2`;
   HAProxy runs in a **VRF context** using `ip vrf exec`. Note: `ip vrf exec` binds
   sockets into a VRF via `SO_BINDTODEVICE`-style mechanisms — it is **not** a
@@ -62,11 +66,29 @@ ad-hoc scripts.
   from the A-record pool. ⚠️ Caveat: most DNS servers (e.g. stock BIND) do **not**
   health-check A-records, so dead nodes keep serving failures. Treat this mode as
   best-effort unless paired with a health-aware DNS/global LB.
-- **Mode C — Anycast (advanced, opt-in):** announce a single S3 VIP from every RGW
-  node via BGP/EVPN (PVE SDN already ships FRR). More robust than DNS-RR and faster
-  to converge than VRRP failover. ⚠️ This **reintroduces an SDN/FRR dependency**,
-  which conflicts with the "decoupled from SDN" principle above, so it must remain
-  explicitly opt-in for sites already running a routed fabric — never the default.
+- **Mode C — BGP/ECMP anycast (advanced, opt-in):** advertise a single S3 VIP as a
+  `/32` host route from every healthy RGW node; the upstream fabric ECMP-balances
+  across nodes. More robust than DNS-RR (real route withdrawal on failure) and
+  faster to converge than VRRP failover. **The dependency is a routing daemon, not
+  the SDN subsystem** — FRR (or a standalone BGP speaker) plus the underlay below;
+  the SDN *overlay* plane (zones/vnets/controllers) is **not** required. Underlay
+  prerequisites (independent of SDN): a loopback/dummy interface holding the VIP,
+  an established BGP (or OSPF/OpenFabric) session to the fabric, and **route-health
+  injection** — withdraw the `/32` when local HAProxy/RGW is unhealthy (scripted,
+  like keepalived's track-script but for BGP; the routing daemon won't health-check
+  the service itself).
+  - **Real coupling to watch — FRR config ownership.** FRR uses a single integrated
+    `frr.conf`, and when SDN runs an EVPN/BGP controller or a fabric, `pve-network`
+    generates and reloads that file. The shared prereq is fine; the conflict is two
+    regenerators writing the same FRR config. Handle it, in order of isolation:
+    1. **Dedicated BGP speaker** (`bird`/`gobgp`/ExaBGP) for anycast RHI — never
+       touches FRR, so zero collision regardless of SDN state. **Default choice;**
+       best fit for the project's blast-radius-isolation / microservice ethos.
+    2. **Own FRR directly** only when SDN's routing features are absent (no EVPN
+       controller / no fabric configured); warn and defer otherwise.
+    3. **Integrate with SDN's FRR generation** when present (go through the same
+       config-generation layer) — most native, most coupling.
+  - Keep opt-in; never the default (Mode A remains default).
 
 Topology note: Mode A (HAProxy + Keepalived) mirrors Ceph's own `cephadm` RGW
 ingress service by design. Copy that proven ingress configuration logic; do **not**
