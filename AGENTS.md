@@ -86,8 +86,13 @@ ad-hoc scripts.
        best fit for the project's blast-radius-isolation / microservice ethos.
     2. **Own FRR directly** only when SDN's routing features are absent (no EVPN
        controller / no fabric configured); warn and defer otherwise.
-    3. **Integrate with SDN's FRR generation** when present (go through the same
-       config-generation layer) — most native, most coupling.
+    3. **Integrate via the existing hook** when SDN is present: SDN appends
+       `/etc/frr/frr.conf.local` into its generated config (`Frr.pm:35`), so our BGP
+       stanzas can ride that file instead of fighting over `/etc/frr/frr.conf`
+       (`Frr.pm:233`, single `integrated-vtysh-config` at `Frr.pm:209`). Most native,
+       but still shares one daemon. Note FRR is only **Recommends**, not Depends
+       (`pve-network/debian/control:34`), and SDN no-ops when `/etc/frr` is absent —
+       confirming the daemon, not SDN, is the actual prerequisite.
   - Keep opt-in; never the default (Mode A remains default).
 
 Topology note: Mode A (HAProxy + Keepalived) mirrors Ceph's own `cephadm` RGW
@@ -98,10 +103,13 @@ adopt `cephadm` as a second control plane beside `pveceph`.
 - **Global storage (`pmxcfs`):** service certificate/key material stored in the
   replicated cluster filesystem under `/etc/pve/priv/<service>/`, using **plain
   file operations** — the same pattern PVE already uses for storage secrets
-  (`/etc/pve/priv/storage/<id>.pw`). This needs **no `pmxcfs` C patch**: arbitrary
-  private subpaths under `/etc/pve/priv/` are already permitted. (A `cfs_register_file`
-  observed-file entry is only needed for *structured* `cfs_read_file/cfs_write_file`
-  config, which raw cert blobs do not require.)
+  (`/etc/pve/priv/storage/<id>.pw`). This needs **no `pmxcfs` C patch** (verified
+  §10): pmxcfs stores *any* file written under `/etc/pve`; the `status.c` /
+  `PVE/Cluster.pm` table is the **observed-files registry** (cached, version-tracked,
+  parseable via `cfs_read_file/cfs_write_file`) — **not** a write-permission gate.
+  Storage `.pw` files and Ceph keyrings (`/etc/pve/priv/ceph/<id>.keyring`) are
+  written as plain files and are *absent* from that table, proving raw secret blobs
+  need no registration and no C change.
 - **Reuse existing ACME plumbing:** integrate with the existing `pve-manager` ACME
   account/plugin framework and surface these service certs in the existing
   Datacenter **Certificates** UI rather than inventing a parallel cert system.
@@ -164,6 +172,13 @@ PVE session-based auth cannot fulfill S3 SigV4. Two control-plane provisioning m
 
 This cannot be 100% greenfield due to Proxmox's monolithic API/UI structures.
 
+> **Not fully greenfield — scaffolding already exists** (verified §10): `pveceph`
+> already recognises `radosgw` as a managed Ceph service
+> (`PVE/Ceph/Services.pm:117`) and the pool API already accepts `rgw` as a pool
+> application (`PVE/API2/Ceph/Pool.pm:308,824`). Build on this; the net-new work is
+> the RGW *lifecycle* (realm/zonegroup/zone, daemon create/destroy), a dedicated
+> `PVE/API2/Ceph/RGW.pm`, the `www/manager6/ceph/` panel, and the gateway package.
+
 - **Greenfield packages:** two net-new `.deb` packages —
   - `pve-ceph-radosgw` — backend Perl logic, dependency mapping, `systemd` automation.
   - `pve-service-gateway` (working name; `pve-infra-proxy` is too generic) —
@@ -201,6 +216,12 @@ Mirror/reference these upstream repos; do **not** vendor blindly — track patch
 | `pve-common` | `https://git.proxmox.com/git/pve-common.git` | `README.dev` build instructions, shared tooling |
 
 Read-only clone form: `git clone git://git.proxmox.com/git/<repo>.git`
+
+**Downstream forks** (for our patch series; mirror of the canonical `git.proxmox.com`
+trees, kept rebased on upstream — see §3 versioning):
+`pve-manager`, `pve-cluster`, `pve-storage`, `pve-network`, `pve-common` are forked
+to `github.com/ciroiriarte/<repo>`. Add upstream as a second remote and rebase:
+`git remote add upstream https://git.proxmox.com/git/<repo>.git`.
 
 ## 5. Development guidelines (from pve.proxmox.com/wiki/Developer_Documentation)
 
@@ -308,9 +329,29 @@ Required tenant workflows the current spec omits:
 - **All-active split assumptions** → see §2.3 Mode B caveat; prefer Mode C anycast
   where real health-based withdrawal is required.
 
+## 10. Upstream code cross-check (verified against source)
+
+Every correction in §§2–4 was checked against freshly-cloned upstream trees
+(`pve-manager` `a03f744`, `pve-cluster` `7091d92`, `pve-storage` `d666ebd`,
+`pve-network` `a2b0e82`; 2026-06-15). Results:
+
+| Assessment claim | Verdict | Evidence (file:line) |
+|---|---|---|
+| No `pmxcfs` C fork needed — store certs as plain files under `/etc/pve/priv/<service>/` | ✅ Confirmed | `pve-storage` `CIFSPlugin.pm:36,51`, `PBSPlugin.pm:87,175`, `CephConfig.pm:409,453` write plain `/etc/pve/priv/...` files; none are in the observed table |
+| Observed-file registry is in `status.c` + `PVE/Cluster.pm`, **not** `memdb.c` | ✅ Confirmed | `pmxcfs/status.c:82-106` (`{.path=...}` table), `PVE/Cluster.pm:61-66`; `memdb.c` is the in-memory store (path lookups/locks, no whitelist) |
+| Modern UI is modular `www/manager6/*.js`; `pvemanagerlib.js` is generated | ✅ Confirmed | `www/manager6/Makefile` concatenates 270+ sources; 13 panels in `www/manager6/ceph/` |
+| RGW CLI → `PVE/CLI/pveceph.pm`, API → `PVE/API2/Ceph/`; partial scaffolding exists | ✅ Confirmed | `PVE/Ceph/Services.pm:117` (radosgw), `PVE/API2/Ceph/Pool.pm:308,824` (`rgw` app); no `RGW.pm` yet |
+| Node certs at `/etc/pve/nodes/<node>/pveproxy-ssl.pem`; cluster ACME plumbing exists | ✅ Confirmed | `PVE/CertHelpers.pm:49`, `PVE/API2/Certificates.pm:73`, `PVE/API2/ACME{,Account,Plugin}.pm`, observed `priv/acme/plugins.cfg` (`status.c:88`) |
+| `ip vrf exec` is VRF-scoped, not a netns | ✅ Confirmed | Linux VRF semantics (external); unchanged from kernel docs |
+| SDN owns the integrated `/etc/frr/frr.conf`; FRR is the prereq, not SDN | ✅ Confirmed | `Frr.pm:233` writes `frr.conf`, `:209` `integrated-vtysh-config`, `:35` `frr.conf.local` hook; `debian/control:34` `Recommends` (not Depends) |
+| ExtJS 7.0.0 | ✅ Confirmed | `www/index.html.tpl`, `debian/control` |
+
+**Net conclusion:** the corrected direction holds end-to-end. Two refinements folded
+back in: (a) RGW is partially scaffolded — extend, don't greenfield (§3); (b) Mode C
+has a concrete coordination hook, `frr.conf.local` (§2.3 option 3).
+
 ---
 
-> **Review status:** §§2–4 above were fact-checked on 2026-06-14 against the current
-> upstream `pve-manager` / `pve-cluster` / `pve-storage` trees and official Ceph,
-> Proxmox, Debian and Linux-VRF docs (tri-model review). §§7–9 capture open design
-> decisions surfaced by that review and must be resolved before implementation.
+> **Review status:** §§2–4 fact-checked 2026-06-14 (tri-model review) and
+> **cross-verified against upstream source 2026-06-15** (§10). §§7–9 capture open
+> design decisions that must be resolved before implementation.

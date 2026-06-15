@@ -16,6 +16,13 @@ Maintained by Ciro Iriarte <ciro.iriarte+software@gmail.com>.
 - AGPLv3 `LICENSE` to match Proxmox VE upstream and enable upstream contribution.
 - Open-design sections (§7 tenant/identity model, §8 operational concerns,
   §9 failure modes) capturing decisions to resolve before implementation.
+- §10 upstream code cross-check: every §§2–4 correction verified against
+  freshly-cloned `pve-manager`/`pve-cluster`/`pve-storage`/`pve-network` source
+  with file:line evidence; all claims confirmed.
+- Mode C (§2.3) `frr.conf.local` integration hook and the FRR-is-Recommends
+  (not Depends) confirmation, sharpening the SDN-vs-FRR boundary.
+- Note that RGW is partially scaffolded upstream (`radosgw` service +
+  `rgw` pool application) — extend rather than greenfield (§3).
 
 ### Changed
 - Fact-checked the spec against current upstream `pve-manager`/`pve-cluster`/
